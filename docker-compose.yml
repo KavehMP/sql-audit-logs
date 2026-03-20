@@ -1,0 +1,17 @@
+services:
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    platform: linux/amd64
+    container_name: mssql-audit-reader
+    environment:
+      - ACCEPT_EULA=Y
+      - MSSQL_SA_PASSWORD=YourStrong@Passw0rd123
+      - MSSQL_PID=Developer
+    ports:
+      - "1433:1433"
+    volumes:
+      # Persistent data volume
+      - ./mssql-data:/var/opt/mssql
+      # Mount the audit logs folder
+      - ./:/var/opt/audit-logs
+    restart: unless-stopped
