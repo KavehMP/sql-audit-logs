@@ -1,51 +1,101 @@
 # sql-audit-logs
 
-A containerized SQL Server 2022 environment for viewing and querying SQL Server Extended Events (XEL) audit logs.
+A containerized SQL Server 2022 environment for downloading, importing, and querying SQL Server Extended Events (XEL) audit logs from Azure Blob Storage.
 
-## Purpose
-
-The goal is simple: be able to open and inspect `.xel` audit log files using standard T-SQL. SQL Server can read XEL files directly — no separate import step needed. The Docker container gives you a SQL Server instance with the XEL files mounted inside it, so you can query them immediately.
+---
 
 ## How It Works
 
-1. Place `.xel` files in the project root
-2. Start the SQL Server container — the root folder is mounted at `/var/opt/audit-logs` inside it
-3. Connect to SQL Server and query the files directly using `sys.fn_xe_file_target_read_file`
+1. Run `download-audit-logs.sh <date>` — downloads XEL files from Azure Blob, starts Docker + SQL Server, and imports everything into `AuditDB.dbo.AuditLogs`
+2. Connect to the local SQL Server and query `AuditLogs` with standard T-SQL
+3. The project root is mounted at `/var/opt/audit-logs` inside the container — XEL files are accessible directly without copying
 
-## Structure
+---
+
+## Project Structure
 
 ```
 sql-audit-logs/
-├── docker-compose.yml       # Container configuration
-├── mssql-data/              # Persistent SQL Server data (mounted into container)
-│   ├── data/                # Database files (.mdf, .ldf)
-│   ├── log/                 # SQL Server error logs, .xel, .trc files
-│   └── secrets/             # Machine-level security keys
-└── *.xel                    # Extended Events audit log files (~160MB total)
+├── docker-compose.yml          # SQL Server 2022 container config
+├── download-audit-logs.sh      # Main script: download + import pipeline
+├── .env                        # Azure Blob SAS credentials (gitignored)
+├── mssql-data/                 # Persistent SQL Server data (gitignored)
+└── YYYY-MM-DD-audit-log/       # Downloaded XEL files per date (gitignored)
 ```
+
+---
 
 ## Prerequisites
 
-- Docker with Rosetta/amd64 emulation support (required for `linux/amd64` image on Apple Silicon)
+- Docker Desktop (Apple Silicon: Rosetta/amd64 emulation required)
 - A SQL Server client: Azure Data Studio, SSMS, or `sqlcmd`
+- `.env` file with Azure Blob credentials (see below)
+
+---
+
+## .env Setup
+
+Create a `.env` file in the project root:
+
+```
+BLOB-SAS-URL=https://<account>.blob.core.windows.net/<container>?<sas>
+BLOB-SAS-TOKEN=<sas-token>
+BLOB-CONTAINER-FOLDER-POINTER=https://<account>.blob.core.windows.net/<container>/<path>/YYYY-MM-DD/
+```
+
+> The SAS token must have **Read** and **List** permissions on the container.
+
+---
 
 ## Usage
 
-### Start the container
+### Download and import audit logs for a date
 
 ```bash
-docker compose up -d
+./download-audit-logs.sh 2026-03-20
 ```
 
-### Connect
+The script will:
+1. Start Docker Desktop if not running
+2. Start the SQL Server container if not running
+3. Wait for SQL Server to accept connections
+4. Download all XEL files for the date from Azure Blob into `2026-03-20-audit-log/`
+5. Create `AuditDB` database if it doesn't exist
+6. Create `AuditLogs` table if it doesn't exist (with indexes)
+7. Import the XEL data — skips if data for that date already exists
 
-- **Host**: `localhost,1433`
-- **Username**: `sa`
-- **Password**: `YourStrong@Passw0rd123`
+### Connect to SQL Server
 
-### Query the audit logs
+| Setting | Value |
+|---------|-------|
+| Host | `localhost,1433` |
+| Username | `sa` |
+| Password | `YourStrong@Passw0rd123` |
+| Database | `AuditDB` |
 
-These XEL files are SQL Server **Database Audit** logs (created via `CREATE SERVER AUDIT`), so they must be read with `fn_get_audit_file` — not `fn_xe_file_target_read_file`.
+### Query imported logs
+
+```sql
+-- All events for a date
+SELECT *
+FROM AuditDB.dbo.AuditLogs
+WHERE CAST(event_time AS DATE) = '2026-03-20'
+ORDER BY event_time;
+
+-- Top slowest queries
+SELECT TOP 100 event_time, duration_milliseconds, client_ip, LEFT(statement, 200)
+FROM AuditDB.dbo.AuditLogs
+ORDER BY duration_milliseconds DESC;
+
+-- Concurrent query pile-up check at a point in time
+SELECT COUNT(*) AS concurrent
+FROM AuditDB.dbo.AuditLogs
+WHERE statement LIKE '%device_details%'
+  AND event_time <= '2026-03-20 09:00:00'
+  AND DATEADD(MILLISECOND, duration_milliseconds, event_time) >= '2026-03-20 09:00:00';
+```
+
+### Query raw XEL files directly (without importing)
 
 ```sql
 SELECT *
@@ -55,140 +105,129 @@ FROM sys.fn_get_audit_file(
 );
 ```
 
-This returns structured columns directly — no XML parsing needed. Key columns:
-
-| Column | Description |
-|--------|-------------|
-| `event_time` | When the event occurred |
-| `action_id` | Type of action (e.g. `SL` = SELECT, `IN` = INSERT) |
-| `server_principal_name` | Login that performed the action |
-| `database_name` | Database affected |
-| `object_name` | Table/object affected |
-| `statement` | The SQL statement executed |
-| `succeeded` | Whether the action succeeded |
-
-To filter by date range or action:
-
-```sql
-SELECT event_time, action_id, server_principal_name, database_name, object_name, statement
-FROM sys.fn_get_audit_file(
-    '/var/opt/audit-logs/2026-03-20-audit-log/*.xel',
-    DEFAULT, DEFAULT
-)
-WHERE event_time >= '2026-03-20 00:00:00'
-  AND succeeded = 1
-ORDER BY event_time;
-```
-
 ### Stop the container
 
 ```bash
 docker compose down
 ```
 
-Data in `mssql-data/` persists across restarts.
+Data in `mssql-data/` and `AuditDB` persist across restarts.
 
-## XEL Files
+---
 
-Naming convention: `HH_MM_SS_mmm_sequence.xel` (time the session segment was created).
+## AuditLogs Table
 
-| File | Size |
-|------|------|
-| 07_41_44_602_980.xel | ~50MB |
-| 07_46_12_148_981.xel | ~50MB |
-| 07_50_48_602_982.xel | ~50MB |
-| 08_25_08_904_983.xel | ~10MB |
+Created automatically on first import via `SELECT INTO` from `sys.fn_get_audit_file`. Key columns:
 
-## Notes
+| Column | Description |
+|--------|-------------|
+| `event_time` | When the event occurred |
+| `action_id` | Action type (`SL` = SELECT, `IN` = INSERT, etc.) |
+| `server_principal_name` | Login that ran the query |
+| `database_name` | Database affected |
+| `object_name` | Table/object affected |
+| `statement` | Full SQL statement |
+| `duration_milliseconds` | Query duration |
+| `client_ip` | Client IP address |
+| `succeeded` | Whether the action succeeded (0 = failed/aborted) |
 
-- SQL Server runs as **Developer Edition** (free, full-featured, not for production)
-- Platform is pinned to `linux/amd64` for SQL Server compatibility (required on Apple Silicon)
-- The container restarts automatically (`unless-stopped`)
+Indexes created on `event_time` and `server_principal_name`.
 
 ---
 
 ## Production View Optimizations
 
-Audit log analysis revealed severe query pile-ups on prod (up to 20 concurrent identical queries, 3–7 second avg duration, peaking at 2 hours during 8–9am). Root cause: `trk.device_details` was being called repeatedly by a polling service at `20.1.208.85` without canceling in-flight requests.
+Audit log analysis (2026-03-20) revealed severe query pile-ups on prod — up to **20 concurrent identical queries**, peaking at **2-hour duration** during 8–9am. Root cause: `trk.device_details` polled repeatedly by service at `20.1.208.85` without canceling in-flight requests.
 
-### Optimization approach
+### Optimization Approach
 
 For each view:
 1. Replace CTE + `ROW_NUMBER()` patterns with `OUTER APPLY TOP 1` — enables index seeks instead of full table scans
 2. Inline scalar UDFs as `CASE` expressions — removes row-by-row execution and unlocks query parallelism
 3. Add covering indexes to support the `OUTER APPLY` seeks
 
-### Scripts
+### Indexes Added to Production
 
-| Script | Purpose |
-|--------|---------|
-| `device_details_v2.sql` | Creates indexes + optimized view for side-by-side comparison |
-| `swap_device_details_view.sql` | Renames views to deploy (v2 → prod, prod → _old) |
+| Index | Table | Columns | Purpose |
+|-------|-------|---------|---------|
+| `IX_ota_req_device_time` | `trk.ota_req` | `(device_id, time_intiated DESC)` | Latest OTA per device |
+| `IX_ota_req_device_status_time` | `trk.ota_req` | `(device_id, status, time_intiated DESC)` | Latest successful OTA per device |
+| `IX_ota_req_otaid` | `trk.ota_req` | `(otaid)` + all columns INCLUDE | OTA lookup by batch ID |
+| `IX_tapecfg_pkgcar` | `trk.tapecfg_db` | `(tape_personality, facility)` filtered to `PkgCar` | Device summary filter |
 
-### Completed
+---
+
+### Views Optimized
 
 #### `trk.device_details` — 2026-03-20
-**Problem:** Two CTEs both doing `ROW_NUMBER()` over 1.7M rows in `trk.ota_req` (no index on `device_id`). Scalar UDF `trk.ufn_GetOnlineStatus` called per-row blocking parallelism.
+**Problem:** Two CTEs scanning 1.7M rows in `trk.ota_req` with `ROW_NUMBER()` (no index on `device_id`). Scalar UDF `trk.ufn_GetOnlineStatus` called per-row blocking parallelism. Polling service firing without canceling prior requests — 20 concurrent copies stacking up.
 
 **Changes:**
 - Replaced both CTEs with `OUTER APPLY TOP 1` against `trk.ota_req`
 - Inlined `ufn_GetOnlineStatus` as a `CASE` expression
-- Created two covering indexes on `trk.ota_req`:
-  - `IX_ota_req_device_time` on `(device_id, time_intiated DESC)`
-  - `IX_ota_req_device_status_time` on `(device_id, status, time_intiated DESC)`
+- Created `IX_ota_req_device_time` and `IX_ota_req_device_status_time`
 
-**Result:** `ota_req` logical reads dropped from **40,381 → ~0**. Query now runs in parallel. Duration went from 3–7s (degrading to hours under load) to sub-second.
+**Result:** `ota_req` logical reads **40,381 → ~0**. Query parallelized. Duration **3–7s → sub-second**.
 
 **Rollback:** `EXEC sp_rename 'trk.device_details', 'device_details_v2'; EXEC sp_rename 'trk.device_details_old', 'device_details';`
 
 ---
 
 #### `trk.device_summary` — 2026-03-20
-**Problem:** `JSON_VALUE` evaluated twice per row (once in `SELECT`, once in `GROUP BY`). `LIKE 'PkgCar'` without wildcards bypasses index seek optimizations.
+**Problem:** `JSON_VALUE` evaluated twice per row (SELECT + GROUP BY). `LIKE 'PkgCar'` without wildcards bypasses index optimizations.
 
 **Changes:**
-- Wrapped query in a CTE so `JSON_VALUE` is computed once per row before grouping
+- Wrapped in CTE to compute `JSON_VALUE` once before grouping
 - Changed `LIKE 'PkgCar'` → `= 'PkgCar'`
-- Created filtered index `IX_tapecfg_pkgcar` on `trk.tapecfg_db (tape_personality, facility)` with INCLUDE columns, filtered to `WHERE tape_personality = 'PkgCar'`
+- Created filtered index `IX_tapecfg_pkgcar`
 
-**Note:** `heartbeats_v4_preserved` join reads 106K logical reads (full scan). Investigated adding persisted computed columns for JSON values but ruled out — table receives ~333 writes/second (100K devices × every 5 min), write overhead outweighs read benefit.
+**Note:** `heartbeats_v4_preserved` join (106K reads) investigated — persisted computed columns ruled out due to ~333 writes/second (100K devices heartbeating every 5 min).
 
-**Result:** Moderate improvement. View was not causing pile-ups (12 calls/day, avg 5s, max 12s).
+**Result:** Moderate improvement. View was not causing pile-ups (12 calls/day, avg 5s).
 
 **Rollback:** `EXEC sp_rename 'trk.device_summary', 'device_summary_v2'; EXEC sp_rename 'trk.device_summary_old', 'device_summary';`
 
 ---
 
 #### `trk.ota_request_tapecfg_merge` — 2026-03-20
-**Problem:** `FULL JOIN` between `tapecfg_db` and `ota_req` (1.7M rows) with no index on `otaid`. Every query filtered by `otaid` but had to scan the full table. Duplicate view `ota_request_tapecfg_merge2` existed with identical definition and zero usage.
+**Problem:** `FULL JOIN` with 1.7M row `ota_req` table, no index on `otaid`. Every query filtered by `otaid` but scanned the full table. Duplicate view `ota_request_tapecfg_merge2` (identical definition, zero usage).
 
 **Changes:**
-- Created index `IX_ota_req_otaid` on `trk.ota_req (otaid)` with all columns as INCLUDE
-- Changed `FULL JOIN` → `LEFT JOIN` starting from `ota_req` (safe: all 252 queries in audit logs filter by `otaid`; 11,002 tapecfg_db-only rows were always filtered out anyway)
-- Dropped duplicate view `trk.ota_request_tapecfg_merge2` (zero calls in audit logs, created 2025-03-21)
+- Created `IX_ota_req_otaid` with all columns as INCLUDE
+- Changed `FULL JOIN` → `LEFT JOIN` from `ota_req` (safe: all 252 audit log queries filter by `otaid`)
+- Dropped `trk.ota_request_tapecfg_merge2`
 
-**Result:** With pagination (FETCH NEXT 100 as used by app): heartbeats reads **54,178 → 412**, tapecfg_db reads **10,467 → 601**, elapsed ~0ms. Index seek on `otaid` makes the 1.7M row scan irrelevant.
+**Result:** With app pagination (FETCH NEXT 100): heartbeats reads **54,178 → 412**, elapsed **~0ms**.
 
 **Rollback:** `EXEC sp_rename 'trk.ota_request_tapecfg_merge', 'ota_request_tapecfg_merge_v2'; EXEC sp_rename 'trk.ota_request_tapecfg_merge_old', 'ota_request_tapecfg_merge';`
 
 ---
 
 #### `trk.selected_devices_final_json` — 2026-03-20
-**Problem:** Identical issues to `device_details` — two CTEs scanning all 1.7M rows of `trk.ota_req` with `ROW_NUMBER()`, scalar UDF `trk.ufn_GetOnlineStatus` blocking parallelism. Additional `selected_devices` CTE using `OPENJSON` to parse per-operator device lists.
+**Problem:** Same as `device_details` — two `ota_req` CTEs + scalar UDF. Additional `selected_devices` CTE using `OPENJSON` to parse per-operator device JSON arrays.
 
 **Changes:**
-- Replaced both `ota_device` and `ota_device_success_history` CTEs with `OUTER APPLY TOP 1` (reuses `IX_ota_req_device_time` and `IX_ota_req_device_status_time` created for `device_details`)
-- Inlined `ufn_GetOnlineStatus` as a `CASE` expression (enables parallelism)
-- Kept `selected_devices` CTE with `OPENJSON` as-is — no structural alternative without schema changes
+- Replaced both OTA CTEs with `OUTER APPLY TOP 1` (reuses existing indexes)
+- Inlined `ufn_GetOnlineStatus` as `CASE` expression
+- Kept `OPENJSON` CTE as-is — no alternative without schema changes
 
-**Result:** `ota_req` logical reads **40,467 → ~0**. Query now runs in parallel. `selected_devices` OPENJSON is now the remaining bottleneck but unavoidable without schema changes.
+**Result:** `ota_req` logical reads **40,467 → ~0**. Query parallelized.
 
 **Rollback:** `EXEC sp_rename 'trk.selected_devices_final_json', 'selected_devices_final_json_v2'; EXEC sp_rename 'trk.selected_devices_final_json_old', 'selected_devices_final_json';`
 
 ---
 
-### Pending (1 remaining)
+#### `trk.ota_summary` — 2026-03-20
+**Status:** Reviewed, no changes needed.
+- Clean aggregation over `trk.ota_req` with no JOINs or scalar UDFs
+- SELECT queries (279 calls) benefit from `IX_ota_req_otaid` created above
+- COUNT(*) queries filter by `test_device` — 99.99% of rows are `test_device = 0`, index would not help
+- Not causing pile-ups (avg 1s, max 8s)
 
-| View | Status |
-|------|--------|
-| `cfg_filtered` ad-hoc query | Pending investigation |
+---
+
+### Pending Investigation
+
+| Item | Description |
+|------|-------------|
+| `cfg_filtered` ad-hoc query | Raw CTE query sent by app (not a view/SP). 74 calls, avg 26s, max 179s. Three `ROW_NUMBER()` window functions over `tapecfg_db`, no pagination. Likely a full device export — needs app-side fix. |
