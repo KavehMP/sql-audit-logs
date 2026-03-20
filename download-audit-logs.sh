@@ -28,9 +28,9 @@ ENV_FILE="$SCRIPT_DIR/.env"
 SAS_TOKEN=$(grep '^BLOB-SAS-TOKEN=' "$ENV_FILE" | cut -d'=' -f2-)
 BASE_FOLDER_URL=$(grep '^BLOB-CONTAINER-FOLDER-POINTER=' "$ENV_FILE" | cut -d'=' -f2-)
 
-BLOB_BASE_PATH=$(echo "$BASE_FOLDER_URL" | sed 's|https://[^/]*/[^/]*/||' | sed 's|[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}/||')
 STORAGE_ACCOUNT="trkspsfcrprodqhddata"
 CONTAINER="sqldbauditlogs"
+BLOB_BASE_PATH=$(echo "$BASE_FOLDER_URL" | sed "s|https://${STORAGE_ACCOUNT}.blob.core.windows.net/${CONTAINER}/||")
 BLOB_PREFIX="${BLOB_BASE_PATH}${DATE}/"
 OUTPUT_DIR="$SCRIPT_DIR/${DATE}-audit-log"
 SQL_SA_PASSWORD="YourStrong@Passw0rd123"

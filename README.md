@@ -40,7 +40,7 @@ Create a `.env` file in the project root:
 ```
 BLOB-SAS-URL=https://<account>.blob.core.windows.net/<container>?<sas>
 BLOB-SAS-TOKEN=<sas-token>
-BLOB-CONTAINER-FOLDER-POINTER=https://<account>.blob.core.windows.net/<container>/<path>/YYYY-MM-DD/
+BLOB-CONTAINER-FOLDER-POINTER=https://<account>.blob.core.windows.net/<container>/<path>/
 ```
 
 > The SAS token must have **Read** and **List** permissions on the container.
