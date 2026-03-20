@@ -43,3 +43,6 @@ mssql-data/
 
 # Fetch client
 .fetch-client/
+
+# SQL scripts (contain production queries and schema details)
+*.sql
